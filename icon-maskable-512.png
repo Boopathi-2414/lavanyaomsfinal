@@ -1,0 +1,141 @@
+// ============================================================
+// SUPABASE — background customer-profile / fraud-history sync
+// ============================================================
+// IMPORTANT — read before wiring this into a real deployment:
+// This file CANNOT create a Supabase project for you. Anthropic/Claude
+// has no ability to provision cloud infrastructure or credentials. To
+// actually use this:
+//   1. Create a free project at https://supabase.com
+//   2. Run the SQL in `supabase_schema.sql` (same folder) in the
+//      Supabase SQL Editor — it creates the `customer_profiles` table.
+//   3. Copy your Project URL + anon public key into a `.env` file at
+//      the project root (see `.env.example`):
+//        VITE_SUPABASE_URL=https://xxxx.supabase.co
+//        VITE_SUPABASE_ANON_KEY=eyJ...
+//   4. Restart `npm run dev` — Vite only reads `.env` at startup.
+//
+// Until those steps are done, `isSupabaseConfigured()` returns false
+// and every function below is a safe no-op that resolves immediately —
+// the app keeps working exactly as before, purely on localStorage. No
+// network call is ever attempted with empty/placeholder credentials, so
+// this can be merged in and shipped without breaking anyone who hasn't
+// set up Supabase yet.
+
+let _client = null;
+let _clientPromise = null;
+
+const SUPABASE_URL  = typeof import.meta !== 'undefined' ? import.meta.env?.VITE_SUPABASE_URL  : undefined;
+const SUPABASE_KEY  = typeof import.meta !== 'undefined' ? import.meta.env?.VITE_SUPABASE_ANON_KEY : undefined;
+
+export function isSupabaseConfigured() {
+  return Boolean(SUPABASE_URL && SUPABASE_KEY);
+}
+
+export async function getClient() {
+  if (!isSupabaseConfigured()) return null;
+  if (_client) return _client;
+  if (!_clientPromise) {
+    _clientPromise = import('@supabase/supabase-js').then(({ createClient }) => {
+      _client = createClient(SUPABASE_URL, SUPABASE_KEY);
+      return _client;
+    }).catch((e) => {
+      console.error('Supabase client failed to load — falling back to localStorage-only mode:', e);
+      _clientPromise = null;
+      return null;
+    });
+  }
+  return _clientPromise;
+}
+
+// Normalises a name/address pair into the same lookup key used by the
+// in-memory `checkFraud()` / `detectRepeatReturners()` logic in db.js, so
+// records written here and records matched there never drift apart.
+function normKey(s) {
+  return (s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
+
+// ── Fire-and-forget upsert ───────────────────────────────────────────
+// Called once per imported order. Never blocks or throws into the
+// caller — PDF import must keep working at full speed even if Supabase
+// is unreachable (offline, bad credentials, RLS misconfigured, etc).
+// Stores the address/phone the dashboard table itself never displays —
+// this is exactly the "hidden background data, used only for fraud
+// flagging" store the UI requirement calls for.
+export async function upsertCustomerProfile({ customer, phone, address, companyId, channel, orderId, orderType }) {
+  try {
+    const client = await getClient();
+    if (!client) return; // not configured — no-op
+    const key = normKey(customer) + '|' + normKey(phone);
+    if (!key.trim().replace('|', '')) return;
+
+    const { data: existing } = await client
+      .from('customer_profiles')
+      .select('id, order_count, return_count')
+      .eq('lookup_key', key)
+      .maybeSingle();
+
+    const isReturnish = orderType === 'Exchange'; // returns themselves are logged via recordReturnOutcome below
+    const orderCount  = (existing?.order_count || 0) + 1;
+    const returnCount = (existing?.return_count || 0) + (isReturnish ? 1 : 0);
+
+    await client.from('customer_profiles').upsert({
+      lookup_key: key,
+      customer_name: customer || '',
+      phone: phone || '',
+      address: address || '',
+      company_id: companyId || 'unknown',
+      channel: channel || '',
+      last_order_id: orderId || '',
+      order_count: orderCount,
+      return_count: returnCount,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'lookup_key' });
+  } catch (e) {
+    console.error('Supabase upsertCustomerProfile failed (non-fatal, continuing on localStorage):', e);
+  }
+}
+
+// Call when an order's status moves to a returned/RTO state, so the
+// background return-rate count used for fraud flagging stays accurate
+// even though the order itself was already upserted once at import time.
+export async function recordReturnOutcome({ customer, phone }) {
+  try {
+    const client = await getClient();
+    if (!client) return;
+    const key = normKey(customer) + '|' + normKey(phone);
+    if (!key.trim().replace('|', '')) return;
+    const { data: existing } = await client
+      .from('customer_profiles')
+      .select('id, return_count')
+      .eq('lookup_key', key)
+      .maybeSingle();
+    if (!existing) return;
+    await client.from('customer_profiles')
+      .update({ return_count: (existing.return_count || 0) + 1, updated_at: new Date().toISOString() })
+      .eq('lookup_key', key);
+  } catch (e) {
+    console.error('Supabase recordReturnOutcome failed (non-fatal):', e);
+  }
+}
+
+// Looks up a customer's stored history for the fraud-flag check. Returns
+// null (never throws) if Supabase isn't configured or the lookup fails —
+// callers should treat null exactly like "no history found", same as
+// the existing localStorage-only `detectRepeatReturners()` does.
+export async function getCustomerProfile({ customer, phone }) {
+  try {
+    const client = await getClient();
+    if (!client) return null;
+    const key = normKey(customer) + '|' + normKey(phone);
+    if (!key.trim().replace('|', '')) return null;
+    const { data } = await client
+      .from('customer_profiles')
+      .select('*')
+      .eq('lookup_key', key)
+      .maybeSingle();
+    return data || null;
+  } catch (e) {
+    console.error('Supabase getCustomerProfile failed (non-fatal):', e);
+    return null;
+  }
+}
